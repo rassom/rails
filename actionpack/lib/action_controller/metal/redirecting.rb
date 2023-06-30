@@ -7,11 +7,9 @@ module ActionController
     include AbstractController::Logger
     include ActionController::UrlFor
 
-    class UnsafeRedirectError < StandardError; end
+    ILLEGAL_HEADER_VALUE_REGEX = /[\x00-\x08\x0A-\x1F]/.freeze
 
-    included do
-      mattr_accessor :raise_on_open_redirects, default: false
-    end
+    class UnsafeRedirectError < StandardError; end
 
     # Redirects the browser to the target specified in +options+. This parameter can be any one of:
     #
@@ -21,7 +19,7 @@ module ActionController
     # * <tt>String</tt> not containing a protocol - The current protocol and host is prepended to the string.
     # * <tt>Proc</tt> - A block that will be executed in the controller's context. Should return any option accepted by +redirect_to+.
     #
-    # === Examples
+    # === Examples:
     #
     #   redirect_to action: "show", id: 5
     #   redirect_to @post
@@ -60,40 +58,18 @@ module ActionController
     #
     # Statements after +redirect_to+ in our controller get executed, so +redirect_to+ doesn't stop the execution of the function.
     # To terminate the execution of the function immediately after the +redirect_to+, use return.
-    #
     #   redirect_to post_url(@post) and return
-    #
-    # === Open Redirect protection
-    #
-    # By default, Rails protects against redirecting to external hosts for your app's safety, so called open redirects.
-    # Note: this was a new default in Rails 7.0, after upgrading opt-in by uncommenting the line with +raise_on_open_redirects+ in <tt>config/initializers/new_framework_defaults_7_0.rb</tt>
-    #
-    # Here #redirect_to automatically validates the potentially-unsafe URL:
-    #
-    #   redirect_to params[:redirect_url]
-    #
-    # Raises UnsafeRedirectError in the case of an unsafe redirect.
-    #
-    # To allow any external redirects pass <tt>allow_other_host: true</tt>, though using a user-provided param in that case is unsafe.
-    #
-    #   redirect_to "https://rubyonrails.org", allow_other_host: true
-    #
-    # See #url_from for more information on what an internal and safe URL is, or how to fall back to an alternate redirect URL in the unsafe case.
     def redirect_to(options = {}, response_options = {})
       raise ActionControllerError.new("Cannot redirect to nil!") unless options
       raise AbstractController::DoubleRenderError if response_body
 
-      allow_other_host = response_options.delete(:allow_other_host) { _allow_other_host }
-
       self.status        = _extract_redirect_to_status(options, response_options)
-      self.location      = _enforce_open_redirect_protection(_compute_redirect_to_location(request, options), allow_other_host: allow_other_host)
-      self.response_body = ""
-    end
 
-    # Soft deprecated alias for #redirect_back_or_to where the +fallback_location+ location is supplied as a keyword argument instead
-    # of the first positional argument.
-    def redirect_back(fallback_location:, allow_other_host: _allow_other_host, **args)
-      redirect_back_or_to fallback_location, allow_other_host: allow_other_host, **args
+      redirect_to_location = _compute_redirect_to_location(request, options)
+      _ensure_url_is_http_header_safe(redirect_to_location)
+
+      self.location      = redirect_to_location
+      self.response_body = "<html><body>You are being <a href=\"#{ERB::Util.unwrapped_html_escape(response.location)}\">redirected</a>.</body></html>"
     end
 
     # Redirects the browser to the page that issued the request (the referrer)
@@ -105,37 +81,35 @@ module ActionController
     # subject to browser security settings and user preferences. If the request
     # is missing this header, the <tt>fallback_location</tt> will be used.
     #
-    #   redirect_back_or_to({ action: "show", id: 5 })
-    #   redirect_back_or_to @post
-    #   redirect_back_or_to "http://www.rubyonrails.org"
-    #   redirect_back_or_to "/images/screenshot.jpg"
-    #   redirect_back_or_to posts_url
-    #   redirect_back_or_to proc { edit_post_url(@post) }
-    #   redirect_back_or_to '/', allow_other_host: false
+    #   redirect_back fallback_location: { action: "show", id: 5 }
+    #   redirect_back fallback_location: @post
+    #   redirect_back fallback_location: "http://www.rubyonrails.org"
+    #   redirect_back fallback_location: "/images/screenshot.jpg"
+    #   redirect_back fallback_location: posts_url
+    #   redirect_back fallback_location: proc { edit_post_url(@post) }
+    #   redirect_back fallback_location: '/', allow_other_host: false
     #
     # ==== Options
+    # * <tt>:fallback_location</tt> - The default fallback location that will be used on missing +Referer+ header.
     # * <tt>:allow_other_host</tt> - Allow or disallow redirection to the host that is different to the current host, defaults to true.
     #
     # All other options that can be passed to #redirect_to are accepted as
-    # options, and the behavior is identical.
-    def redirect_back_or_to(fallback_location, allow_other_host: _allow_other_host, **options)
-      if request.referer && (allow_other_host || _url_host_allowed?(request.referer))
-        redirect_to request.referer, allow_other_host: allow_other_host, **options
-      else
-        # The method level `allow_other_host` doesn't apply in the fallback case, omit and let the `redirect_to` handling take over.
-        redirect_to fallback_location, **options
-      end
+    # options and the behavior is identical.
+    def redirect_back(fallback_location:, allow_other_host: true, **args)
+      referer = request.headers["Referer"]
+      redirect_to_referer = referer && (allow_other_host || _url_host_allowed?(referer))
+      redirect_to redirect_to_referer ? referer : fallback_location, **args
     end
 
-    def _compute_redirect_to_location(request, options) # :nodoc:
+    def _compute_redirect_to_location(request, options) #:nodoc:
       case options
       # The scheme name consist of a letter followed by any combination of
       # letters, digits, and the plus ("+"), period ("."), or hyphen ("-")
       # characters; and is terminated by a colon (":").
       # See https://tools.ietf.org/html/rfc3986#section-3.1
       # The protocol relative scheme starts with a double slash "//".
-      when /\A([a-z][a-z\d\-+.]*:|\/\/).*/i
-        options.to_str
+      when /\A([a-z][a-z\d\-+\.]*:|\/\/).*/i
+        options
       when String
         request.protocol + request.host_with_port + options
       when Proc
@@ -147,35 +121,7 @@ module ActionController
     module_function :_compute_redirect_to_location
     public :_compute_redirect_to_location
 
-    # Verifies the passed +location+ is an internal URL that's safe to redirect to and returns it, or nil if not.
-    # Useful to wrap a params provided redirect URL and fallback to an alternate URL to redirect to:
-    #
-    #   redirect_to url_from(params[:redirect_url]) || root_url
-    #
-    # The +location+ is considered internal, and safe, if it's on the same host as <tt>request.host</tt>:
-    #
-    #   # If request.host is example.com:
-    #   url_from("https://example.com/profile") # => "https://example.com/profile"
-    #   url_from("http://example.com/profile")  # => "http://example.com/profile"
-    #   url_from("http://evil.com/profile")     # => nil
-    #
-    # Subdomains are considered part of the host:
-    #
-    #   # If request.host is on https://example.com or https://app.example.com, you'd get:
-    #   url_from("https://dev.example.com/profile") # => nil
-    #
-    # NOTE: there's a similarity with {url_for}[rdoc-ref:ActionDispatch::Routing::UrlFor#url_for], which generates an internal URL from various options from within the app, e.g. <tt>url_for(@post)</tt>.
-    # However, #url_from is meant to take an external parameter to verify as in <tt>url_from(params[:redirect_url])</tt>.
-    def url_from(location)
-      location = location.presence
-      location if location && _url_host_allowed?(location)
-    end
-
     private
-      def _allow_other_host
-        !raise_on_open_redirects
-      end
-
       def _extract_redirect_to_status(options, response_options)
         if options.is_a?(Hash) && options.key?(:status)
           Rack::Utils.status_code(options.delete(:status))
@@ -186,23 +132,21 @@ module ActionController
         end
       end
 
-      def _enforce_open_redirect_protection(location, allow_other_host:)
-        if allow_other_host || _url_host_allowed?(location)
-          location
-        else
-          raise UnsafeRedirectError, "Unsafe redirect to #{location.truncate(100).inspect}, pass allow_other_host: true to redirect anyway."
-        end
-      end
-
       def _url_host_allowed?(url)
-        host = URI(url.to_s).host
-
-        return true if host == request.host
-        return false unless host.nil?
-        return false unless url.to_s.start_with?("/")
-        !url.to_s.start_with?("//")
+        URI(url.to_s).host == request.host
       rescue ArgumentError, URI::Error
         false
+      end
+
+      def _ensure_url_is_http_header_safe(url)
+        # Attempt to comply with the set of valid token characters
+        # defined for an HTTP header value in
+        # https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.6
+        if url.match(ILLEGAL_HEADER_VALUE_REGEX)
+          msg = "The redirect URL #{url} contains one or more illegal HTTP header field character. " \
+            "Set of legal characters defined in https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.6"
+          raise UnsafeRedirectError, msg
+        end
       end
   end
 end
